@@ -1,4 +1,10 @@
+from pathlib import Path
+import sys
+
 import streamlit as st
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from runway.models import Bill, CreditCard
 from runway.planner import calculate_plan, get_cushion_target
@@ -150,6 +156,17 @@ def main() -> None:
                 min_value=0.0,
                 value=75.0,
             )
+            credit_limit = st.number_input(
+                f"Credit limit {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                help="Leave at $0 if you do not want Runway to check limit risk for this card.",
+            )
+            expected_new_charges = st.number_input(
+                f"Expected new charges before due date {i + 1}",
+                min_value=0.0,
+                value=0.0,
+            )
             due = st.date_input(f"Card due date {i + 1}")
             cards.append(
                 CreditCard(
@@ -158,6 +175,8 @@ def main() -> None:
                     apr=apr,
                     minimum_payment=minimum,
                     due_date=due,
+                    credit_limit=credit_limit or None,
+                    expected_new_charges_until_due=expected_new_charges,
                 )
             )
 
@@ -204,8 +223,8 @@ def main() -> None:
                 f"${plan['safe_daily_spend']:,.2f}/day",
             )
             st.metric(
-                "Extra after paycheck",
-                f"${plan['extra_after_required']:,.2f}",
+                "Current-cycle extra",
+                f"${plan['spendable_extra_before_payday']:,.2f}",
             )
 
         if plan["risk_level"] == "Red":
@@ -220,24 +239,64 @@ def main() -> None:
         st.write(f"Days until paycheck: {plan['days_to_paycheck']}")
         st.write(f"Bills due: ${plan['total_bills_due']:,.2f}")
         st.write(f"Credit card minimums due: ${plan['total_minimums_due']:,.2f}")
+        st.write(
+            f"Extra card limit protection: "
+            f"${plan['card_limit_safety_payments_due']:,.2f}"
+        )
         st.write(f"Essential spending: ${plan['essential_spending']:,.2f}")
         st.write(f"Cash cushion: ${plan['cushion_target']:,.2f}")
 
-        st.subheader("Paycheck allocation")
+        if plan["card_limit_risks"]:
+            st.subheader("Card limit risk")
+
+            for risk in plan["card_limit_risks"]:
+                if risk["risk_level"] == "Over-limit risk":
+                    st.error(
+                        f"{risk['card_name']}: minimum payment may not be enough. "
+                        f"Estimated extra needed above minimum: "
+                        f"${risk['additional_payment_needed_above_minimum']:,.2f}."
+                    )
+                elif risk["risk_level"] == "Near limit":
+                    st.warning(
+                        f"{risk['card_name']}: projected utilization after minimum "
+                        f"is {risk['projected_utilization'] * 100:.1f}%."
+                    )
+                else:
+                    st.success(
+                        f"{risk['card_name']}: projected to stay under the limit "
+                        f"after the minimum payment."
+                    )
+
+                st.write(
+                    f"Projected available credit after minimum: "
+                    f"${risk['available_credit_after_minimum']:,.2f}"
+                )
+
+        st.subheader("Before payday allocation")
 
         for category, amount in plan["paycheck_allocation"].items():
             st.write(f"{category}: ${amount:,.2f}")
 
-        if plan["extra_after_required"] > 0:
+        if plan["spendable_extra_before_payday"] > 0:
             st.success(
-                f"Extra available after required expenses and cushion: "
-                f"${plan['extra_after_required']:,.2f}"
+                f"Current-cycle extra after required expenses and cushion: "
+                f"${plan['spendable_extra_before_payday']:,.2f}"
             )
         else:
             st.error(
-                f"Shortfall after paycheck: "
-                f"${abs(plan['extra_after_required']):,.2f}"
+                f"Shortfall before payday: "
+                f"${abs(plan['cash_left_before_payday']):,.2f}"
             )
+
+        st.subheader("On payday")
+        st.write(
+            f"Next paycheck reserved for the next cycle: "
+            f"${plan['next_paycheck_reserved_for_next_cycle']:,.2f}"
+        )
+        st.caption(
+            "Runway does not treat the next paycheck as extra until next-cycle bills "
+            "and essentials are included."
+        )
 
         if plan["debt_target"] and plan["extra_to_debt"] > 0:
             st.info(
@@ -253,4 +312,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

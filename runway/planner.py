@@ -51,6 +51,58 @@ def choose_debt_target(
     return None
 
 
+def estimate_card_limit_risk(card: CreditCard) -> Optional[dict]:
+    if card.credit_limit is None or card.credit_limit <= 0:
+        return None
+
+    estimated_interest = card.balance * (card.apr / 100) / 12
+    projected_balance_after_minimum = (
+        card.balance
+        + estimated_interest
+        + card.expected_new_charges_until_due
+        - card.minimum_payment
+    )
+    available_credit_after_minimum = (
+        card.credit_limit - projected_balance_after_minimum
+    )
+    projected_utilization = (
+        projected_balance_after_minimum / card.credit_limit
+    )
+    payment_needed_to_stay_under_limit = max(
+        card.balance
+        + estimated_interest
+        + card.expected_new_charges_until_due
+        - card.credit_limit,
+        0.0,
+    )
+    additional_payment_needed_above_minimum = max(
+        payment_needed_to_stay_under_limit - card.minimum_payment,
+        0.0,
+    )
+
+    if additional_payment_needed_above_minimum > 0:
+        risk_level = "Over-limit risk"
+    elif projected_utilization >= 0.90:
+        risk_level = "Near limit"
+    else:
+        risk_level = "OK"
+
+    return {
+        "card_name": card.name,
+        "credit_limit": card.credit_limit,
+        "estimated_interest": estimated_interest,
+        "expected_new_charges_until_due": card.expected_new_charges_until_due,
+        "projected_balance_after_minimum": projected_balance_after_minimum,
+        "available_credit_after_minimum": available_credit_after_minimum,
+        "projected_utilization": projected_utilization,
+        "payment_needed_to_stay_under_limit": payment_needed_to_stay_under_limit,
+        "additional_payment_needed_above_minimum": (
+            additional_payment_needed_above_minimum
+        ),
+        "risk_level": risk_level,
+    }
+
+
 def calculate_plan(
     checking_balance: float,
     next_paycheck_amount: float,
@@ -76,10 +128,21 @@ def calculate_plan(
 
     total_bills_due = sum(bill.amount for bill in upcoming_bills)
     total_minimums_due = sum(card.minimum_payment for card in upcoming_card_minimums)
+    card_limit_risks = [
+        risk for risk in (
+            estimate_card_limit_risk(card) for card in upcoming_card_minimums
+        )
+        if risk is not None
+    ]
+    card_limit_safety_payments_due = sum(
+        risk["additional_payment_needed_above_minimum"]
+        for risk in card_limit_risks
+    )
 
     required_before_payday = (
         total_bills_due
         + total_minimums_due
+        + card_limit_safety_payments_due
         + essential_spending_until_payday
         + cushion_target
     )
@@ -89,7 +152,9 @@ def calculate_plan(
     risk_level = get_risk_level(runway_after_required, safe_daily_spend)
 
     cash_after_paycheck = checking_balance + next_paycheck_amount
-    extra_after_required = cash_after_paycheck - required_before_payday
+    cash_left_before_payday = runway_after_required
+    spendable_extra_before_payday = max(cash_left_before_payday, 0.0)
+    next_paycheck_reserved_for_next_cycle = next_paycheck_amount
 
     debt_target = choose_debt_target(cards, debt_strategy)
 
@@ -97,27 +162,29 @@ def calculate_plan(
     extra_to_savings = 0.0
     extra_to_keep_as_cash = 0.0
 
-    if extra_after_required > 0:
+    if spendable_extra_before_payday > 0:
         if plan_mode == "Survival":
-            extra_to_keep_as_cash = extra_after_required
+            extra_to_keep_as_cash = spendable_extra_before_payday
 
         elif plan_mode == "Paydown":
-            extra_to_debt = extra_after_required
+            extra_to_debt = spendable_extra_before_payday
 
         elif plan_mode == "Balanced":
-            extra_to_savings = extra_after_required * 0.50
-            extra_to_debt = extra_after_required * 0.50
+            extra_to_savings = spendable_extra_before_payday * 0.50
+            extra_to_debt = spendable_extra_before_payday * 0.50
 
     paycheck_allocation = {
         "Starting checking balance": checking_balance,
-        "Next paycheck": next_paycheck_amount,
-        "Bills due": total_bills_due,
-        "Credit card minimums": total_minimums_due,
-        "Essential spending": essential_spending_until_payday,
-        "Cash cushion": cushion_target,
-        "Extra kept as cash": extra_to_keep_as_cash,
-        "Extra to savings": extra_to_savings,
-        "Extra to debt": extra_to_debt,
+        "Bills due before payday": total_bills_due,
+        "Credit card minimums before payday": total_minimums_due,
+        "Extra card limit protection": card_limit_safety_payments_due,
+        "Essential spending before payday": essential_spending_until_payday,
+        "Cash cushion protected": cushion_target,
+        "Cash left before payday": cash_left_before_payday,
+        "Next paycheck reserved for next cycle": next_paycheck_reserved_for_next_cycle,
+        "Current-cycle extra kept as cash": extra_to_keep_as_cash,
+        "Current-cycle extra to savings": extra_to_savings,
+        "Current-cycle extra to debt": extra_to_debt,
     }
 
     recommendations = []
@@ -140,14 +207,14 @@ def calculate_plan(
             "You can make it to payday with your cushion protected."
         )
 
-    if extra_after_required <= 0:
+    if spendable_extra_before_payday <= 0:
         recommendations.append(
-            "After your next paycheck, there is no extra cash available beyond required expenses and your cushion."
+            "There is no current-cycle extra cash available beyond required expenses and your cushion."
         )
     else:
         if plan_mode == "Survival":
             recommendations.append(
-                f"Survival mode: keep the extra ${extra_after_required:,.2f} as cash instead of making extra debt payments."
+                f"Survival mode: keep the current-cycle extra ${spendable_extra_before_payday:,.2f} as cash instead of making extra debt payments."
             )
 
         elif plan_mode == "Balanced":
@@ -165,6 +232,16 @@ def calculate_plan(
                     "Paydown mode selected, but no credit cards were entered."
                 )
 
+    for risk in card_limit_risks:
+        if risk["additional_payment_needed_above_minimum"] > 0:
+            recommendations.append(
+                f"{risk['card_name']} may need an extra ${risk['additional_payment_needed_above_minimum']:,.2f} above the minimum payment to avoid going over the credit limit."
+            )
+        elif risk["risk_level"] == "Near limit":
+            recommendations.append(
+                f"{risk['card_name']} is projected to stay under its limit after the minimum payment, but utilization would still be about {risk['projected_utilization'] * 100:.1f}%."
+            )
+
     if debt_target and extra_to_debt > 0:
         if debt_strategy == "Avalanche":
             recommendations.append(
@@ -179,6 +256,8 @@ def calculate_plan(
         "days_to_paycheck": days_to_paycheck,
         "total_bills_due": total_bills_due,
         "total_minimums_due": total_minimums_due,
+        "card_limit_risks": card_limit_risks,
+        "card_limit_safety_payments_due": card_limit_safety_payments_due,
         "essential_spending": essential_spending_until_payday,
         "cushion_target": cushion_target,
         "required_before_payday": required_before_payday,
@@ -187,7 +266,10 @@ def calculate_plan(
         "risk_level": risk_level,
         "next_paycheck_amount": next_paycheck_amount,
         "cash_after_paycheck": cash_after_paycheck,
-        "extra_after_required": extra_after_required,
+        "cash_left_before_payday": cash_left_before_payday,
+        "spendable_extra_before_payday": spendable_extra_before_payday,
+        "next_paycheck_reserved_for_next_cycle": next_paycheck_reserved_for_next_cycle,
+        "extra_after_required": spendable_extra_before_payday,
         "paycheck_allocation": paycheck_allocation,
         "debt_target": debt_target.name if debt_target else None,
         "extra_to_debt": extra_to_debt,
@@ -195,4 +277,3 @@ def calculate_plan(
         "extra_to_keep_as_cash": extra_to_keep_as_cash,
         "recommendations": recommendations,
     }
-
